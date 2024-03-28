@@ -57,7 +57,7 @@ defmodule AeMdw.AexnTransfers do
           paginated_transfers =
             state
             |> build_streamer(cursors, key_boundary)
-            |> Collection.paginate(pagination, & &1, &serialize_cursor/1)
+            |> Collection.paginate(pagination, fn %{item: item} -> item end, &serialize_cursor/1)
 
           {:ok, paginated_transfers}
         end
@@ -177,7 +177,7 @@ defmodule AeMdw.AexnTransfers do
             from_cursor_key
           )
           |> Stream.map(fn {create_txi, sender_pk, call_txi, recipient_pk, value, log_idx} ->
-            {create_txi, call_txi, sender_pk, recipient_pk, value, log_idx}
+            {{create_txi, call_txi, sender_pk, recipient_pk, value, log_idx}, :from}
           end),
           state
           |> Collection.stream(
@@ -187,11 +187,29 @@ defmodule AeMdw.AexnTransfers do
             to_cursor_key
           )
           |> Stream.map(fn {create_txi, recipient_pk, call_txi, sender_pk, value, log_idx} ->
-            {create_txi, call_txi, sender_pk, recipient_pk, value, log_idx}
+            {{create_txi, call_txi, sender_pk, recipient_pk, value, log_idx}, :to}
           end)
         ],
         direction
       )
+      |> Stream.transform(%{from: from_cursor_key, to: to_cursor_key}, fn
+        item, current_cursors ->
+          case item do
+            {{create_txi, call_txi, sender_pk, recipient_pk, value, log_idx} = response, :from} ->
+              {[Map.put_new(current_cursors, :item, response)],
+               %{
+                 current_cursors
+                 | from: {create_txi, sender_pk, call_txi, recipient_pk, value, log_idx}
+               }}
+
+            {{create_txi, call_txi, sender_pk, recipient_pk, value, log_idx} = response, :to} ->
+              {[Map.put_new(current_cursors, :item, response)],
+               %{
+                 current_cursors
+                 | to: {create_txi, recipient_pk, call_txi, sender_pk, value, log_idx}
+               }}
+          end
+      end)
     end
   end
 
@@ -201,6 +219,9 @@ defmodule AeMdw.AexnTransfers do
     end
   end
 
+  defp serialize_cursor(%{from: from, to: to}),
+    do: %{from: from, to: to} |> :erlang.term_to_binary() |> Base.encode64()
+
   defp serialize_cursor(cursor), do: cursor |> :erlang.term_to_binary() |> Base.encode64()
 
   defp deserialize_cursor(nil), do: {:ok, nil}
@@ -208,20 +229,7 @@ defmodule AeMdw.AexnTransfers do
   defp deserialize_cursor(<<cursor_bin64::binary>>) do
     with {:ok, cursor_bin} <- Base.decode64(cursor_bin64),
          cursor_term <- :erlang.binary_to_term(cursor_bin),
-         true <-
-           (elem(cursor_term, 0) in [:aex9, :aex141] or is_integer(elem(cursor_term, 0))) and
-             (match?(
-                {_type_or_pk, <<_pk1::256>>, _txi, <<_pk2::256>>, _amount, _idx},
-                cursor_term
-              ) or
-                match?(
-                  {_type_or_pk, <<_pk1::256>>, <<_pk2::256>>, _txi, _amount, _idx},
-                  cursor_term
-                ) or
-                match?(
-                  {_type_or_pk, _txi, <<_pk1::256>>, <<_pk2::256>>, _amount, _idx},
-                  cursor_term
-                )) do
+         true <- validate_cursor(cursor_term) do
       {:ok, cursor_term}
     else
       _invalid ->
@@ -229,26 +237,59 @@ defmodule AeMdw.AexnTransfers do
     end
   end
 
+  defp validate_cursor(%{from: from, to: to}), do: validate_cursor(from) and validate_cursor(to)
+
+  defp validate_cursor({type_or_pk, <<_pk1::256>>, _txi, <<_pk2::256>>, _amount, _idx})
+       when is_integer(type_or_pk) or type_or_pk in [:aex9, :aex141],
+       do: true
+
+  defp validate_cursor({type_or_pk, <<_pk_pk1::256>>, <<_pk2::256>>, _txi, _amount, _idx})
+       when is_integer(type_or_pk) or type_or_pk in [:aex9, :aex141],
+       do: true
+
+  defp validate_cursor({type_or_pk, _txi, <<_pk1::256>>, <<_pk2::256>>, _amount, _idx})
+       when is_integer(type_or_pk) or type_or_pk in [:aex9, :aex141],
+       do: true
+  defp validate_cursor(nil), do: true
+
+  defp validate_cursor(_), do: false
+
   defp deserialize_account_cursors(_state, nil), do: {:ok, {nil, nil}}
 
   defp deserialize_account_cursors(state, cursor_bin) do
-    with {:ok, cursor} <- deserialize_cursor(cursor_bin) do
-      {create_txi, call_txi, pk1, pk2, token_id, log_idx} = cursor
-      cursor = {create_txi, pk1, call_txi, pk2, token_id, log_idx}
+    cursor_bin
+    |> deserialize_cursor()
+    |> case do
+      {:ok, %{from: from, to: to}} ->
+        {State.exists?(state, Model.AexnContractFromTransfer, from),
+         State.exists?(state, Model.AexnContractToTransfer, to)}
+        |> case do
+          {true, true} -> {:ok, {from, to}}
+          {false, true} -> {:ok, {to, to}}
+          {true, false} -> {:ok, {from, from}}
+          {false, false} -> {:ok, {nil, nil}}
+        end
 
-      if State.exists?(state, Model.AexnContractFromTransfer, cursor) do
-        {:ok,
-         {
-           cursor,
-           {create_txi, pk2, call_txi, pk1, token_id, log_idx}
-         }}
-      else
-        {:ok,
-         {
-           cursor,
-           cursor
-         }}
-      end
+      {:ok, cursor} ->
+        {create_txi, call_txi, pk1, pk2, token_id, log_idx} = cursor
+        cursor = {create_txi, pk1, call_txi, pk2, token_id, log_idx}
+
+        if State.exists?(state, Model.AexnContractFromTransfer, cursor) do
+          {:ok,
+           {
+             cursor,
+             {create_txi, pk2, call_txi, pk1, token_id, log_idx}
+           }}
+        else
+          {:ok,
+           {
+             cursor,
+             cursor
+           }}
+        end
+      {:error, _err} = err -> 
+        err
+        
     end
   end
 
