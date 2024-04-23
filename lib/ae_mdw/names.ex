@@ -347,7 +347,6 @@ defmodule AeMdw.Names do
          scope,
          cursor
        ) do
-    IO.inspect({owner_pk, state, scope, cursor}, label: "build_height_streamer")
     key_boundary = serialize_owner_deactivation_key_boundary(owner_pk, scope)
     cursor = serialize_owner_deactivation_cursor(owner_pk, cursor)
 
@@ -370,8 +369,6 @@ defmodule AeMdw.Names do
     key_boundary = serialize_owner_deactivation_key_boundary(owner_pk, scope)
     cursor = serialize_owner_deactivation_cursor(owner_pk, cursor)
 
-    IO.inspect({owner_pk, state, scope, cursor}, label: "build_height_streamer")
-
     fn direction ->
       state
       |> Collection.stream(@table_inactive_owner_deactivation, direction, key_boundary, cursor)
@@ -384,8 +381,6 @@ defmodule AeMdw.Names do
   defp build_height_streamer(%{owned_by: owner_pk}, state, _order_by, scope, cursor) do
     key_boundary = serialize_owner_deactivation_key_boundary(owner_pk, scope)
     cursor = serialize_owner_deactivation_cursor(owner_pk, cursor)
-
-    IO.inspect({owner_pk, state, scope, cursor}, label: "build_height_streamer")
 
     fn direction ->
       active_stream =
